@@ -1,0 +1,120 @@
+// ==UserScript==
+// @name         Grok → Ollama Bridge  - Code & UI Optimized
+// @namespace    https://github.com/yourname
+// @version      5.5
+// @description  Clean relay that ignores Grok's UI buttons/toolbars inside code blocks
+// @match        https://grok.com/*
+// @match        https://grok.x.ai/*
+// @match        https://x.com/i/grok*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+    'use strict';
+    let ws = null;
+    let currentRequestId = null;
+
+    function connectWebSocket() {
+        if (ws && ws.readyState === WebSocket.OPEN) return;
+        ws = new WebSocket("ws://localhost:11434/ws");
+        ws.onopen = () => console.log("✅ Bridge V5.5: Code & UI Optimized Active");
+        ws.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "send_prompt") {
+                currentRequestId = msg.request_id;
+                document.querySelectorAll('.response-content-markdown').forEach(el => el.classList.add('bridge-old'));
+                if (await sendPrompt(msg.prompt)) observeAndRelay();
+            }
+        };
+        ws.onclose = () => setTimeout(connectWebSocket, 2000);
+    }
+
+    async function sendPrompt(prompt) {
+        const input = document.querySelector('div.tiptap.ProseMirror[contenteditable="true"]');
+        const sendBtn = document.querySelector('button[type="submit"], button[aria-label*="Send"]');
+        if (!input || !sendBtn) return false;
+        input.focus();
+        document.execCommand('insertText', false, prompt);
+        await new Promise(r => setTimeout(r, 500));
+        sendBtn.click();
+        return true;
+    }
+
+    function observeAndRelay() {
+        let fullTextSent = ""; 
+        let debounceTimer = null;
+
+        const observer = new MutationObserver(() => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                const blocks = document.querySelectorAll('.response-content-markdown:not(.bridge-old)');
+                const block = blocks[blocks.length - 1]; 
+                if (!block) return;
+
+                function getMarkdown(node) {
+                    let text = "";
+                    node.childNodes.forEach(child => {
+                        if (child.nodeType === Node.TEXT_NODE) {
+                            text += child.textContent;
+                        } else if (child.nodeType === Node.ELEMENT_NODE) {
+                            // CRITICAL: Ignore Grok's internal UI toolbars/buttons
+                            if (child.classList.contains('pro-code-toolbar') || 
+                                child.tagName === 'BUTTON' || 
+                                child.getAttribute('aria-label') === 'Copy') {
+                                return;
+                            }
+
+                            const tag = child.tagName;
+                            switch (tag) {
+                                case 'P': text += `\n${getMarkdown(child)}\n`; break;
+                                case 'PRE': text += `\n\`\`\`\n${getMarkdown(child)}\n\`\`\`\n`; break;
+                                case 'CODE': 
+                                    // If it's a multi-line code block, don't wrap every line in backticks
+                                    text += child.closest('pre') ? getMarkdown(child) : `\`${getMarkdown(child)}\``;
+                                    break;
+                                case 'TABLE': text += `\n${getMarkdown(child)}\n`; break;
+                                case 'TR': text += `\n| ${getMarkdown(child)}`; break;
+                                case 'TD': case 'TH': text += `${getMarkdown(child)} | `; break;
+                                default:
+                                    if (tag.startsWith('H') && tag.length === 2) {
+                                        text += `\n${'#'.repeat(tag[1])} ${getMarkdown(child)}\n`;
+                                    } else {
+                                        text += getMarkdown(child);
+                                    }
+                            }
+                        }
+                    });
+                    return text;
+                }
+
+                let rawContent = getMarkdown(block).trim()
+                    .replace(/\n{3,}/g, '\n\n')
+                    .replace(/(\| \n)/g, '|\n');
+
+                if (rawContent.length > fullTextSent.length) {
+                    const newChunk = rawContent.substring(fullTextSent.length);
+                    fullTextSent = rawContent;
+                    
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ 
+                            type: "response_chunk", 
+                            request_id: currentRequestId, 
+                            chunk: newChunk 
+                        }));
+                    }
+                }
+
+                // Detect completion
+                const isFinished = !!block.closest('.w-full')?.querySelector('.action-buttons.last-response, [aria-label*="Copy"]');
+                if (isFinished) {
+                    observer.disconnect();
+                    ws.send(JSON.stringify({ type: "response_done", request_id: currentRequestId }));
+                }
+            }, 150); 
+        });
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+
+    setTimeout(connectWebSocket, 1000);
+})();
